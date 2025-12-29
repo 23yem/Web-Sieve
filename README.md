@@ -45,7 +45,7 @@ sudo python3 websieve.py 10.10.10.5
 ```
 
 ### Multiple Targets
-Don't have to worry about spaces after comma. I strip away whitespace in my code.
+MAKE SURE not to include a space after the comma!
 ```
 sudo python3 websieve.py 10.10.10.5,10.10.10.17
 ```
