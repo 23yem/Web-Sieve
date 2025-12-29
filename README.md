@@ -44,6 +44,12 @@ This tool relies on external binaries. You must have these installed on your sys
 sudo python3 websieve.py 10.10.10.5
 ```
 
+### Multiple Targets
+Don't have to worry about spaces after comma. I strip away whitespace in my code.
+```
+sudo python3 websieve.py 10.10.10.5,10.10.10.17
+```
+
 ### IP Range
 ```bash
 sudo python3 websieve.py 10.10.10.1-50
