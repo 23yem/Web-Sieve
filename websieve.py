@@ -7,6 +7,10 @@ import sys
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suppress the "Insecure Request" warnings in the terminal
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- CONFIGURATION ---
 WORDLIST = "/usr/share/wordlists/dirb/common.txt" 
@@ -19,43 +23,44 @@ def log(msg):
     """
     tqdm.write(msg)
 
-def parse_targets(target_str):
-    ips = []
-    if "-" in target_str:
-        try:
-            start_ip, end_val = target_str.split("-")
-            base_ip = ".".join(start_ip.split(".")[:-1])
-            start_octet = int(start_ip.split(".")[-1])
-            end_octet = int(end_val)
-            for i in range(start_octet, end_octet + 1):
-                ips.append(f"{base_ip}.{i}")
-        except ValueError:
-            log(f"[!] Error parsing range: {target_str}")
-            return []
-    elif "/" in target_str:
-        try:
-            net = ipaddress.ip_network(target_str, strict=False)
-            for ip in net.hosts():
-                ips.append(str(ip))
-        except ValueError:
-            log(f"[!] Error parsing CIDR: {target_str}")
-            return []
-    else:
-        ips.append(target_str)
-    return ips
-
-def port_scan(target_ip):
+def discover_live_hosts(target_input):
+    """
+    Phase 1: Fast Host Discovery.
+    Since ICMP is allowed, we use -PE (Standard Ping).
+    We also keep -PS (TCP SYN) as a backup for weird firewalls.
+    """
     nm = nmap.PortScanner()
-    log(f"[{target_ip}] Starting Port Scan...")
+    log(f"[*] Phase 1: Ping Sweeping [{target_input}] to find live hosts...")
     
     try:
-        # -Pn: Treat host as online (fixes the "no output" issue)
-        # -sS: SYN scan (faster, requires sudo)
-        # -T4: Fast timing
-        nm.scan(target_ip, arguments='-p- -T4 --open -n -Pn -sS')
+        # -sn: Ping Scan only (No port scan yet)
+        # -PE: ICMP Echo (Standard Ping)
+        # -PS445,3389: TCP Probe to common Windows ports (Just in case ICMP fails)
+        # -n: No DNS resolution (Speed boost)
+        nm.scan(target_input, arguments='-sn -PE -PS445,3389 -n')
+        
+        # Get list of hosts that are 'up'
+        live_hosts = nm.all_hosts()
+        log(f"[*] Discovery complete. Found {len(live_hosts)} live hosts.")
+        return live_hosts
+    except Exception as e:
+        log(f"[!] Discovery Error: {e}")
+        return []
+
+def port_scan(target_ip):
+    """
+    Phase 2: Deep Port Scan.
+    Includes timeout safety to prevent hanging on zombie hosts.
+    """
+    nm = nmap.PortScanner()
+    log(f"[{target_ip}] Starting Deep Port Scan (-p-)...")
+    
+    try:
+        # --max-retries 1: Don't retry endlessly if a packet is dropped
+        # --host-timeout 2m: If scan takes > 2 mins, kill it.
+        nm.scan(target_ip, arguments='-p- -T4 --open -n -Pn -sS --max-retries 1 --host-timeout 2m')
         
         if target_ip not in nm.all_hosts():
-            log(f"[{target_ip}] Host seems down (or blocks probes).")
             return []
             
         open_ports = []
@@ -70,18 +75,28 @@ def port_scan(target_ip):
         return []
 
 def identify_web_service(ip, port):
-    protocols = ['http', 'https']
+    """
+    Phase 3: Web Service Identification.
+    Tries HTTPS first to avoid 400 Bad Request errors on SSL ports.
+    """
+    protocols = ['https', 'http']
+    
     for proto in protocols:
         url = f"{proto}://{ip}:{port}"
         try:
-            requests.get(url, timeout=2, verify=False)
+            # We accept 400/401/403/200/etc, but if it's a protocol error, requests will raise an exception.
+            requests.get(url, timeout=3, verify=False)
             return url
         except requests.exceptions.RequestException:
+            # If HTTPS fails (e.g. it's a plaintext port), this catches it and we loop to HTTP.
             pass
     return None
 
 def run_gobuster(url, target_ip):
-    # Safety clean for filename
+    """
+    Phase 4: Directory Brute-force.
+    Handles Wildcard errors gracefully.
+    """
     filename_safe_url = url.split("://")[1].replace(":", "_").replace("/", "")
     output_file = os.path.join(OUTPUT_DIR, f"{filename_safe_url}.txt")
     
@@ -99,15 +114,30 @@ def run_gobuster(url, target_ip):
     ]
     
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log(f"[{target_ip}] FINISHED: {url} -> Saved to {output_file}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Check if Gobuster failed (non-zero exit code)
+        if result.returncode != 0:
+            # Check for the specific "Wildcard" error
+            if "the server returns a status code that matches the provided options" in result.stderr:
+                log(f"[{target_ip}] SKIPPING: {url} (Wildcard Response detected - Server responds to everything)")
+            else:
+                log(f"[!] Gobuster Error on {url}:\n{result.stderr}")
+        else:
+            # Only report success if the file has content
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                log(f"[{target_ip}] FINISHED: {url} -> Saved to {output_file}")
+            else:
+                log(f"[{target_ip}] FINISHED: {url} (No results found)")
+                
     except Exception as e:
-        log(f"[{target_ip}] Gobuster Error on {url}: {e}")
+        log(f"[{target_ip}] Subprocess Error on {url}: {e}")
 
 def workflow_per_host(ip):
     # 1. Scan Ports
     ports = port_scan(ip)
     if not ports:
+        log(f"[{ip}] Scan finished. No open ports found.")
         return
 
     log(f"[{ip}] Open ports: {ports}")
@@ -132,26 +162,35 @@ def main():
     parser.add_argument("target", help="Target IP, Range, or CIDR")
     args = parser.parse_args()
 
+    # Ensure output directory exists
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    target_list = parse_targets(args.target)
-    log(f"[*] Loaded {len(target_list)} targets.")
-    
-    # Check for sudo if using SYN scan
+    # Check for Root privileges (Required for Nmap SYN scan)
     if os.geteuid() != 0:
         log("[!] WARNING: You are not running as root. Nmap -sS scan will fail.")
-        log("[!] Please run with sudo.")
         sys.exit(1)
 
-    # PARALLEL EXECUTION WITH PROGRESS BAR
+    # --- FIX FOR COMMA SEPARATED LISTS ---
+    # Nmap prefers spaces between targets. We simply swap commas for spaces.
+    formatted_target = args.target.replace(",", " ")
+
+    # PHASE 1: HOST DISCOVERY
+    # Filters the potential IPs down to just the alive ones.
+    live_targets = discover_live_hosts(formatted_target)
+    
+    if not live_targets:
+        log("[!] No live hosts found. Exiting.")
+        sys.exit(0)
+
+    # PHASE 2: DEEP SCANNING
+    # Run heavy scans only on alive hosts
+    log(f"[*] Starting deep scans on {len(live_targets)} hosts...")
+    
     with ThreadPoolExecutor(max_workers=MAX_HOST_CONCURRENCY) as executor:
-        # Submit all tasks
-        futures = [executor.submit(workflow_per_host, ip) for ip in target_list]
+        futures = [executor.submit(workflow_per_host, ip) for ip in live_targets]
         
-        # as_completed allows the bar to update as each host finishes
-        # tqdm wraps the loop to create the bar
-        for _ in tqdm(as_completed(futures), total=len(target_list), desc="Scanning Targets", unit="host"):
+        for _ in tqdm(as_completed(futures), total=len(live_targets), desc="Scanning Targets", unit="host"):
             pass
 
     log("[*] All scans completed.")
