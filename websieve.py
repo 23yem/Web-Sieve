@@ -13,7 +13,7 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- CONFIGURATION ---
-WORDLIST = "/usr/share/wordlists/seclists/Discovery/Web-Content/raft-medium-words.txt" 
+WORDLIST = "/usr/share/wordlists/dirb/common.txt" 
 OUTPUT_DIR = "results"
 MAX_HOST_CONCURRENCY = 5
 
