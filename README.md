@@ -1,6 +1,6 @@
 # Web-Sieve
 
-**Web-Sieve** is a lightweight, multi-threaded reconnaissance orchestrator designed for Penetration Testing Competitions (CPTC, etc.). 
+**Web-Sieve** is a lightweight, multi-threaded reconnaissance orchestrator designed for Penetration Testing.
 
 It automates the tedious process of finding web servers across a large scope. It scans for open ports, identifies HTTP/HTTPS services (on standard and non-standard ports), and automatically launches directory brute-forcing attacks, all while managing concurrency to prevent overloading target hosts.
 
